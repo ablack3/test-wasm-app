@@ -20,7 +20,13 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      # lfs: true is required, not optional. The two largest covariate_balance
+      # tables are stored in Git LFS; without this the checkout yields 130-byte
+      # pointer files, the build happily copies them into dist/, and the
+      # deployed site serves text where DuckDB expects Parquet.
       - uses: actions/checkout@v4
+        with:
+          lfs: true
 
       - uses: actions/setup-node@v4
         with:
@@ -58,6 +64,15 @@ jobs:
             fi
           done
           echo "studies: $(python3 -c "import json;print(len(json.load(open('public/data/manifest.json'))))")"
+          # Every Parquet file must start with the "PAR1" magic bytes. An LFS
+          # checkout that did not smudge leaves a small text pointer instead,
+          # which would deploy silently and only fail in the browser.
+          while IFS= read -r f; do
+            if [ "$(head -c 4 "$f")" != "PAR1" ]; then
+              echo "::error::$f is not a Parquet file (LFS pointer not resolved?)"
+              missing=1
+            fi
+          done < <(find public/data -name '*.parquet')
           exit $missing
 
       - name: Build
