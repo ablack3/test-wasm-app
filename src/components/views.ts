@@ -11,7 +11,7 @@ import {
   type Diagnostic,
   type Verdict,
 } from "../data/model";
-import { query } from "../data/db";
+import { query, lit } from "../data/db";
 import { renderFunnel } from "../charts/funnel";
 import { renderForest } from "../charts/forest";
 import {
@@ -26,6 +26,7 @@ export interface ViewContext {
   selection: Selection;
   lookups: Lookups;
   estimates: EstimateRow[];
+  studyName: string;
   targetName: string;
   comparatorName: string;
 }
@@ -56,10 +57,11 @@ export async function renderOverview(
       <h2>${escapeHtml(shortName(ctx.targetName))} vs ${escapeHtml(
         shortName(ctx.comparatorName),
       )}</h2>
-      <p class="hint">New users with prior rheumatoid arthritis in
-        ${escapeHtml(ctx.selection.databaseId)}, propensity-score stratified.
-        Every calibrated figure on this page is computed in your browser from
-        this comparison's ${fit.nControls} negative controls.</p>
+      <p class="hint">${escapeHtml(ctx.studyName)} · ${escapeHtml(
+        ctx.selection.databaseId,
+      )} · analysis ${ctx.selection.analysisId}. Every calibrated figure on this
+        page is computed in your browser from this comparison's
+        ${fit.nControls} negative controls.</p>
       <div class="tiles" id="ov-tiles"></div>
     </div>
     ${panel(
@@ -462,11 +464,9 @@ export async function renderAboutView(
   root.innerHTML = `
     ${panel(
       "Study",
-      "Effect estimates from the OHDSI COVID-19 study of IL-6 and JAK " +
-        "inhibitors in patients with rheumatoid arthritis, comparing new users " +
-        "of each drug against comparator DMARDs across three US claims " +
-        "databases. Results are read straight from Parquet by DuckDB-WASM in " +
-        "your browser; there is no server.",
+      "Cohorts, outcomes, and analysis settings as the study authors defined " +
+        "them. Results are read straight from Parquet by DuckDB-WASM in your " +
+        "browser; there is no server.",
       "ab-study",
     )}
     ${panel("Exposure cohorts", "", "ab-exposures")}
@@ -479,7 +479,8 @@ export async function renderAboutView(
     )}`;
 
   select(root, "ab-study").innerHTML = `
-    <p class="muted small">Currently showing:
+    <p class="muted small">Currently showing
+      <strong>${escapeHtml(ctx.studyName)}</strong>:
       <strong>${escapeHtml(ctx.targetName)}</strong> vs
       <strong>${escapeHtml(ctx.comparatorName)}</strong> in
       ${escapeHtml(ctx.selection.databaseId)}.</p>`;
@@ -520,7 +521,9 @@ export async function renderAboutView(
     max_date: string;
   }>(
     `SELECT database_id, MIN(min_date) AS min_date, MAX(max_date) AS max_date
-       FROM comparison_summary GROUP BY database_id ORDER BY database_id`,
+       FROM comparison_summary
+      WHERE study_id = ${lit(ctx.selection.studyId)}
+      GROUP BY database_id ORDER BY database_id`,
   );
 
   renderTable(

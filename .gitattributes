@@ -1,2 +1,6 @@
+# Study results are compressed columnar data: never diff, never merge, never
+# normalise line endings.
+*.parquet binary
+*.wasm binary
 public/data/OutcomeMisclassificationEval/covariate_balance.parquet filter=lfs diff=lfs merge=lfs -text
 public/data/QbaEvaluation/covariate_balance.parquet filter=lfs diff=lfs merge=lfs -text

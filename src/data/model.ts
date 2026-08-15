@@ -17,10 +17,20 @@ import {
 } from "./calibration";
 
 export interface Selection {
+  studyId: string;
   databaseId: string;
   targetId: number;
   comparatorId: number;
   analysisId: number;
+}
+
+export interface Study {
+  study_id: string;
+  study_name: string;
+  n_estimates: number;
+  n_databases: number;
+  n_comparisons: number;
+  n_analyses: number;
 }
 
 export interface EstimateRow {
@@ -51,6 +61,7 @@ export interface EstimateRow {
 }
 
 export interface Lookups {
+  studies: Study[];
   databases: { database_id: string; database_name: string }[];
   exposures: { exposure_id: number; exposure_name: string }[];
   outcomes: { outcome_id: number; outcome_name: string }[];
@@ -67,37 +78,66 @@ export function shortName(name: string): string {
     .trim();
 }
 
-export async function loadLookups(): Promise<Lookups> {
-  const [databases, exposures, outcomes, analyses, comparisons] =
+/** The study catalogue, loaded once at startup. */
+export async function loadStudies(): Promise<Study[]> {
+  return query<Study>(`SELECT * FROM study ORDER BY study_name`);
+}
+
+/**
+ * Filter options for one study. Databases, comparisons, and analyses all differ
+ * per study, so this is re-read whenever the study changes.
+ */
+export async function loadLookups(studyId: string): Promise<Lookups> {
+  const scope = `study_id = ${lit(studyId)}`;
+  const [studies, databases, exposures, outcomes, analyses, comparisons] =
     await Promise.all([
+      loadStudies(),
       query<Lookups["databases"][number]>(
-        `SELECT database_id, database_name FROM database ORDER BY database_id`,
+        `SELECT DISTINCT database_id,
+                COALESCE(MAX(database_name), database_id) AS database_name
+           FROM database WHERE ${scope}
+          GROUP BY database_id ORDER BY database_id`,
       ),
       query<Lookups["exposures"][number]>(
-        `SELECT exposure_id, exposure_name FROM exposure_of_interest
-         ORDER BY exposure_name`,
+        `SELECT exposure_id, MAX(exposure_name) AS exposure_name
+           FROM exposure_of_interest WHERE ${scope}
+          GROUP BY exposure_id ORDER BY 2`,
       ),
       query<Lookups["outcomes"][number]>(
-        `SELECT outcome_id, outcome_name FROM outcome_of_interest
-         ORDER BY outcome_name`,
+        `SELECT outcome_id, MAX(outcome_name) AS outcome_name
+           FROM outcome_of_interest WHERE ${scope}
+          GROUP BY outcome_id ORDER BY 2`,
       ),
       query<Lookups["analyses"][number]>(
-        `SELECT analysis_id, description FROM cohort_method_analysis
-         ORDER BY analysis_id`,
+        `SELECT analysis_id, MAX(description) AS description
+           FROM cohort_method_analysis WHERE ${scope}
+          GROUP BY analysis_id ORDER BY analysis_id`,
       ),
       query<Lookups["comparisons"][number]>(
         `SELECT DISTINCT target_id, comparator_id FROM cohort_method_result
-         ORDER BY target_id, comparator_id`,
+          WHERE ${scope} ORDER BY target_id, comparator_id`,
       ),
     ]);
-  return { databases, exposures, outcomes, analyses, comparisons };
+  return { studies, databases, exposures, outcomes, analyses, comparisons };
 }
 
-function where(s: Selection): string {
-  return `database_id = ${lit(s.databaseId)}
-      AND target_id = ${s.targetId}
-      AND comparator_id = ${s.comparatorId}
-      AND analysis_id = ${s.analysisId}`;
+/**
+ * Scope for the per-study diagnostic tables, which carry no study_id column.
+ * Pass an alias when the query joins another table, or the shared column names
+ * are ambiguous.
+ */
+function where(s: Selection, alias = ""): string {
+  const q = alias ? `${alias}.` : "";
+  return `${q}database_id = ${lit(s.databaseId)}
+      AND ${q}target_id = ${s.targetId}
+      AND ${q}comparator_id = ${s.comparatorId}
+      AND ${q}analysis_id = ${s.analysisId}`;
+}
+
+/** Scope for the stacked index tables, which do carry study_id. */
+function whereIndexed(s: Selection, alias = ""): string {
+  const q = alias ? `${alias}.` : "";
+  return `${q}study_id = ${lit(s.studyId)} AND ${where(s, alias)}`;
 }
 
 /**
@@ -111,9 +151,11 @@ export async function loadEstimates(s: Selection): Promise<EstimateRow[]> {
               AS outcome_name,
             n.outcome_id IS NOT NULL AS is_negative_control
        FROM cohort_method_result r
-       LEFT JOIN outcome_of_interest o USING (outcome_id)
-       LEFT JOIN negative_control_outcome n USING (outcome_id)
-      WHERE ${where(s)}`,
+       LEFT JOIN outcome_of_interest o
+              ON o.outcome_id = r.outcome_id AND o.study_id = r.study_id
+       LEFT JOIN negative_control_outcome n
+              ON n.outcome_id = r.outcome_id AND n.study_id = r.study_id
+      WHERE ${whereIndexed(s, "r")}`,
   );
   return calibrate(rows);
 }
@@ -125,12 +167,21 @@ export async function loadOutcomeAcrossDatabases(
 ): Promise<EstimateRow[]> {
   const out: EstimateRow[] = [];
   const databases = await query<{ database_id: string }>(
-    `SELECT DISTINCT database_id FROM cohort_method_result ORDER BY database_id`,
+    `SELECT DISTINCT database_id FROM cohort_method_result
+      WHERE study_id = ${lit(s.studyId)} ORDER BY database_id`,
   );
-  for (const { database_id } of databases) {
-    const rows = await loadEstimates({ ...s, databaseId: database_id });
-    const hit = rows.find((r) => r.outcome_id === outcomeId);
-    if (hit) out.push(hit);
+  // Each loadEstimates call re-fits the calibration for the database it reads,
+  // overwriting the fit the visible tab is describing. Restore it afterwards so
+  // opening a drilldown cannot change the numbers behind the funnel plot.
+  const saved = lastFit;
+  try {
+    for (const { database_id } of databases) {
+      const rows = await loadEstimates({ ...s, databaseId: database_id });
+      const hit = rows.find((r) => r.outcome_id === outcomeId);
+      if (hit) out.push(hit);
+    }
+  } finally {
+    lastFit = saved;
   }
   return out;
 }
@@ -229,8 +280,6 @@ export interface BalanceRow {
   covariate_name: string;
   std_diff_before: number | null;
   std_diff_after: number | null;
-  target_mean_before: number | null;
-  comparator_mean_before: number | null;
   target_mean_after: number | null;
   comparator_mean_after: number | null;
 }
@@ -241,11 +290,10 @@ export async function loadBalance(s: Selection): Promise<BalanceRow[]> {
             COALESCE(c.covariate_name, 'Covariate ' || b.covariate_id)
               AS covariate_name,
             b.std_diff_before, b.std_diff_after,
-            b.target_mean_before, b.comparator_mean_before,
             b.target_mean_after, b.comparator_mean_after
        FROM covariate_balance b
        LEFT JOIN covariate c USING (covariate_id)
-      WHERE ${where(s)}
+      WHERE ${where(s, "b")}
         AND b.std_diff_before IS NOT NULL
         AND b.std_diff_after IS NOT NULL`,
   );
@@ -409,7 +457,7 @@ export async function loadDiagnostics(s: Selection): Promise<Diagnostic[]> {
   const counts = await queryOne<{ n_estimable: number; n_total: number }>(
     `SELECT COUNT(*) FILTER (WHERE rr IS NOT NULL) AS n_estimable,
             COUNT(*) AS n_total
-       FROM cohort_method_result WHERE ${where(s)}`,
+       FROM cohort_method_result WHERE ${whereIndexed(s)}`,
   );
   if (counts) {
     const frac = counts.n_total ? counts.n_estimable / counts.n_total : 0;

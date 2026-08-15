@@ -39,14 +39,25 @@ jobs:
       - name: Verify study data is present
         run: |
           missing=0
-          for table in cohort_method_result negative_control_outcome \
-                       outcome_of_interest exposure_of_interest covariate_balance \
-                       preference_score_dist kaplan_meier_dist; do
-            if [ ! -s "public/data/$table.parquet" ]; then
-              echo "::error::missing public/data/$table.parquet"
+          for table in study cohort_method_result negative_control_outcome \
+                       outcome_of_interest exposure_of_interest \
+                       cohort_method_analysis database comparison_summary; do
+            if [ ! -s "public/data/index/$table.parquet" ]; then
+              echo "::error::missing public/data/index/$table.parquet"
               missing=1
             fi
           done
+          test -s public/data/manifest.json || {
+            echo "::error::missing public/data/manifest.json"; missing=1; }
+          # Every study in the catalogue must have its own directory of
+          # diagnostics, or its Diagnostics tab silently renders empty.
+          for study in $(python3 -c "import json;print(' '.join(json.load(open('public/data/manifest.json'))))"); do
+            if [ ! -d "public/data/$study" ]; then
+              echo "::error::manifest lists $study but public/data/$study is missing"
+              missing=1
+            fi
+          done
+          echo "studies: $(python3 -c "import json;print(len(json.load(open('public/data/manifest.json'))))")"
           exit $missing
 
       - name: Build
@@ -61,7 +72,8 @@ jobs:
           test -d dist/data
           # The app is useless without a DuckDB wasm bundle and a data file.
           ls dist/assets/*.wasm >/dev/null
-          ls dist/data/*.parquet >/dev/null
+          ls dist/data/index/*.parquet >/dev/null
+          test -s dist/data/manifest.json
           # Assets must resolve beneath the Pages base path, not site root.
           grep -q 'src="/${{ github.event.repository.name }}/assets/' dist/index.html
           echo "dist size: $(du -sh dist | cut -f1)"

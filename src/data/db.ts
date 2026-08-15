@@ -23,14 +23,26 @@ const BUNDLES: duckdb.DuckDBBundles = {
 
 export type Row = Record<string, unknown>;
 
-/** Parquet files under public/data, registered as views of the same name. */
-const TABLES = [
+/**
+ * Small tables stacked across every study and keyed by `study_id`. Registered
+ * at startup; they drive the filters, the funnel plot, and calibration.
+ */
+const INDEX_TABLES = [
+  "study",
   "cohort_method_result",
   "cohort_method_analysis",
   "exposure_of_interest",
   "outcome_of_interest",
   "negative_control_outcome",
   "database",
+  "comparison_summary",
+] as const;
+
+/**
+ * Large tables written per study. Registered only when a study is selected, so
+ * opening the app does not pull the diagnostics for all 23 studies.
+ */
+const STUDY_TABLES = [
   "covariate",
   "covariate_analysis",
   "covariate_balance",
@@ -38,13 +50,12 @@ const TABLES = [
   "kaplan_meier_dist",
   "attrition",
   "cm_follow_up_dist",
-  "comparison_summary",
-  "propensity_model",
-  "exposure_summary",
 ] as const;
 
 let connection: duckdb.AsyncDuckDBConnection | null = null;
+let database: duckdb.AsyncDuckDB | null = null;
 let ready: Promise<duckdb.AsyncDuckDBConnection> | null = null;
+let registeredStudy: string | null = null;
 
 /** Absolute URL for an asset, honouring the GitHub Pages base path. */
 export function assetUrl(path: string): string {
@@ -65,23 +76,155 @@ async function connect(
 
   const conn = await db.connect();
 
-  onProgress("Registering study results…");
-  for (const table of TABLES) {
-    const url = assetUrl(`data/${table}.parquet`);
-    await db.registerFileURL(
-      `${table}.parquet`,
-      url,
-      duckdb.DuckDBDataProtocol.HTTP,
-      false,
-    );
-    await conn.query(
-      `CREATE OR REPLACE VIEW ${table} AS
-         SELECT * FROM read_parquet('${table}.parquet')`,
-    );
+  onProgress("Registering study catalogue…");
+  for (const table of INDEX_TABLES) {
+    await registerView(db, conn, table, `data/index/${table}.parquet`);
   }
 
   connection = conn;
+  database = db;
   return conn;
+}
+
+/**
+ * Point a view at a Parquet file served over HTTP. DuckDB issues range
+ * requests, so only the row groups a query touches are fetched.
+ */
+async function registerView(
+  db: duckdb.AsyncDuckDB,
+  conn: duckdb.AsyncDuckDBConnection,
+  view: string,
+  path: string,
+): Promise<void> {
+  const handle = path.replace(/\//g, "_");
+  await db.registerFileURL(
+    handle,
+    assetUrl(path),
+    duckdb.DuckDBDataProtocol.HTTP,
+    false,
+  );
+  await conn.query(
+    `CREATE OR REPLACE VIEW ${view} AS SELECT * FROM read_parquet('${handle}')`,
+  );
+}
+
+/**
+ * Make one study's per-study diagnostic tables queryable under their plain
+ * names. Cheap and idempotent: registering a view does not fetch anything.
+ *
+ * A study that shipped no rows for a given table gets an empty view with the
+ * right columns, so callers never have to special-case a missing table.
+ */
+export async function useStudy(studyId: string): Promise<void> {
+  const conn = connection ?? (await initDb());
+  if (registeredStudy === studyId) return;
+  const db = database;
+  if (!db) throw new Error("DuckDB is not initialised");
+
+  const present = new Set(await studyTables(studyId));
+  for (const table of STUDY_TABLES) {
+    if (present.has(table)) {
+      await registerView(db, conn, table, `data/${studyId}/${table}.parquet`);
+    } else {
+      await conn.query(`CREATE OR REPLACE VIEW ${table} AS ${emptyView(table)}`);
+    }
+  }
+  registeredStudy = studyId;
+}
+
+/** Which per-study tables a study actually shipped, from the manifest. */
+let manifest: Record<string, string[]> | null = null;
+
+async function studyTables(studyId: string): Promise<string[]> {
+  if (!manifest) {
+    const response = await fetch(assetUrl("data/manifest.json"));
+    manifest = (await response.json()) as Record<string, string[]>;
+  }
+  return manifest[studyId] ?? [];
+}
+
+/**
+ * Column stubs so a query against a table a study never shipped returns no
+ * rows instead of raising. Only the columns the app selects are declared.
+ */
+const EMPTY_COLUMNS: Record<string, Record<string, string>> = {
+  covariate: {
+    covariate_id: "INTEGER",
+    covariate_name: "VARCHAR",
+    covariate_analysis_id: "INTEGER",
+  },
+  covariate_analysis: {
+    covariate_analysis_id: "INTEGER",
+    covariate_analysis_name: "VARCHAR",
+    analysis_id: "INTEGER",
+  },
+  covariate_balance: {
+    database_id: "VARCHAR",
+    target_id: "INTEGER",
+    comparator_id: "INTEGER",
+    analysis_id: "INTEGER",
+    covariate_id: "INTEGER",
+    std_diff_before: "DOUBLE",
+    target_mean_after: "DOUBLE",
+    comparator_mean_after: "DOUBLE",
+    std_diff_after: "DOUBLE",
+  },
+  preference_score_dist: {
+    database_id: "VARCHAR",
+    target_id: "INTEGER",
+    comparator_id: "INTEGER",
+    analysis_id: "INTEGER",
+    preference_score: "DOUBLE",
+    target_density: "DOUBLE",
+    comparator_density: "DOUBLE",
+  },
+  kaplan_meier_dist: {
+    database_id: "VARCHAR",
+    target_id: "INTEGER",
+    comparator_id: "INTEGER",
+    outcome_id: "INTEGER",
+    analysis_id: "INTEGER",
+    time: "DOUBLE",
+    target_survival: "DOUBLE",
+    target_survival_lb: "DOUBLE",
+    target_survival_ub: "DOUBLE",
+    comparator_survival: "DOUBLE",
+    comparator_survival_lb: "DOUBLE",
+    comparator_survival_ub: "DOUBLE",
+  },
+  attrition: {
+    database_id: "VARCHAR",
+    exposure_id: "INTEGER",
+    target_id: "INTEGER",
+    comparator_id: "INTEGER",
+    outcome_id: "INTEGER",
+    analysis_id: "INTEGER",
+    sequence_number: "INTEGER",
+    description: "VARCHAR",
+    subjects: "INTEGER",
+  },
+  cm_follow_up_dist: {
+    database_id: "VARCHAR",
+    target_id: "INTEGER",
+    comparator_id: "INTEGER",
+    outcome_id: "INTEGER",
+    analysis_id: "INTEGER",
+    target_p25_days: "DOUBLE",
+    target_median_days: "DOUBLE",
+    target_p75_days: "DOUBLE",
+    target_max_days: "DOUBLE",
+    comparator_p25_days: "DOUBLE",
+    comparator_median_days: "DOUBLE",
+    comparator_p75_days: "DOUBLE",
+    comparator_max_days: "DOUBLE",
+  },
+};
+
+function emptyView(table: string): string {
+  const columns = Object.entries(EMPTY_COLUMNS[table] ?? {})
+    .map(([name, type]) => `CAST(NULL AS ${type}) AS ${name}`)
+    .join(", ");
+  return `SELECT ${columns} WHERE FALSE`;
 }
 
 export function initDb(
