@@ -193,12 +193,27 @@ function parseHash(): Partial<AppState> {
 
 async function onHashChange(): Promise<void> {
   const study = studyFromHash();
-  if (study && study !== state.studyId) {
+  const switched = Boolean(study) && study !== state.studyId;
+  if (study && switched) {
     await selectStudy(study);
     state.studyId = study;
-    renderFilters();
   }
+
+  // parseHash only returns values valid for the study now loaded, so anything
+  // it omits is inherited from the previous state. Across a study switch that
+  // inheritance is wrong -- editing only the #study= parameter would keep the
+  // old study's database and cohort ids and query an empty selection -- so
+  // clamp to the new study's options first.
   const next = { ...state, ...parseHash() };
+  if (switched) {
+    state = next;
+    reconcile();
+    renderFilters();
+    closeDrawer();
+    await renderTab();
+    return;
+  }
+
   if (JSON.stringify(next) === JSON.stringify(state)) return;
   state = next;
   closeDrawer();
