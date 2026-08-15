@@ -1,0 +1,83 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege needed to publish a Pages artifact via OIDC.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Let an in-flight deploy finish rather than cancelling it mid-publish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      # The Parquet files are committed under public/data (see data-prep/convert.R),
+      # so the build needs no R toolchain. Fail loudly if they ever go missing
+      # rather than shipping an app with nothing to query.
+      - name: Verify study data is present
+        run: |
+          missing=0
+          for table in cohort_method_result negative_control_outcome \
+                       outcome_of_interest exposure_of_interest covariate_balance \
+                       preference_score_dist kaplan_meier_dist; do
+            if [ ! -s "public/data/$table.parquet" ]; then
+              echo "::error::missing public/data/$table.parquet"
+              missing=1
+            fi
+          done
+          exit $missing
+
+      - name: Build
+        env:
+          # Derive the base path from the repo name so a rename can't break assets.
+          BASE_PATH: /${{ github.event.repository.name }}/
+        run: npm run build
+
+      - name: Verify build output
+        run: |
+          test -f dist/index.html
+          test -d dist/data
+          # The app is useless without a DuckDB wasm bundle and a data file.
+          ls dist/assets/*.wasm >/dev/null
+          ls dist/data/*.parquet >/dev/null
+          # Assets must resolve beneath the Pages base path, not site root.
+          grep -q 'src="/${{ github.event.repository.name }}/assets/' dist/index.html
+          echo "dist size: $(du -sh dist | cut -f1)"
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
